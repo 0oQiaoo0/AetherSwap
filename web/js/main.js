@@ -53,6 +53,16 @@ function pushLyricLine(text, subText) {
   _lastLyricText = text;
   const track = el("step-scroll-track");
   if (!track) return;
+  if (!track.dataset.live) {
+    track.dataset.live = "1";
+    const seed = track.querySelector(".lyric-line");
+    if (seed && !subText) {
+      seed.textContent = text;
+      seed.style.opacity = "1";
+      return;
+    }
+    if (seed) seed.remove();
+  }
   const LINE_H = 24;
   const MAX_LINES = 10;
   const oldSub = track.querySelector(".lyric-sub");
@@ -120,7 +130,7 @@ async function refreshStatus() {
     if (inline) inline.textContent = statusText;
     const stepDesc = d.step || "";
     const item = d.progress_item || "";
-    const newText = stepDesc && item ? `${stepDesc}：${item}` : (stepDesc || item || "—");
+    const newText = stepDesc && item ? `${stepDesc}：${item}` : (stepDesc || item || statusText);
     const nextItem = d.next_progress_item || "";
     const subText = stepDesc && nextItem ? `${stepDesc}：${nextItem}` : nextItem;
     pushLyricLine(newText, subText);

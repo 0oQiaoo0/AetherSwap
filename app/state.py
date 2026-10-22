@@ -150,7 +150,7 @@ class State:
     def get_pending_payment(self) -> Optional[dict]:
         with self._lock:
             return self._pending_payment
-    def wait_payment_confirm(self, timeout_seconds: Optional[float] = None) -> bool:
+    def wait_payment_confirm(self, timeout_seconds: Optional[float] = None) -> Optional[bool]:
         with self._confirm:
             self._user_confirmed = None
             deadline = (time.time() + timeout_seconds) if timeout_seconds is not None else None
@@ -160,12 +160,12 @@ class State:
                 if self._stop_requested:
                     return False
                 if deadline is not None and time.time() >= deadline:
-                    return False
+                    return None
                 wait_time = 1.0
                 if deadline is not None:
                     remaining = deadline - time.time()
                     if remaining <= 0:
-                        return False
+                        return None
                     wait_time = min(1.0, remaining)
                 self._confirm.wait(timeout=wait_time)
     def confirm_payment(self, ok: bool) -> None:
@@ -243,7 +243,7 @@ def set_pending_payment(p: Optional[dict]) -> None:
     get_state().set_pending_payment(p)
 def get_pending_payment() -> Optional[dict]:
     return get_state().get_pending_payment()
-def wait_payment_confirm(timeout_seconds: Optional[float] = None) -> bool:
+def wait_payment_confirm(timeout_seconds: Optional[float] = None) -> Optional[bool]:
     return get_state().wait_payment_confirm(timeout_seconds=timeout_seconds)
 def confirm_payment(ok: bool) -> None:
     get_state().confirm_payment(ok)

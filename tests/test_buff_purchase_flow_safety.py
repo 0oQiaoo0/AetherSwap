@@ -303,7 +303,7 @@ def test_stale_buff_cache_is_refreshed_before_locking():
     result = steps.lock_and_confirm_payment(client, item, _config(), **kwargs)
 
     assert result is None
-    assert client.get_calls == 1
+    assert client.get_calls == 2
     assert client.locked_order_ids == ["new-order"]
     assert item["_buff_sell_orders"][0]["id"] == "new-order"
 
@@ -367,7 +367,7 @@ def test_explicit_payment_failure_email_skips_and_clears_checkout(monkeypatch):
         _pay_method = "alipay"
 
         def get_sell_orders(self, _goods_id, _game):
-            raise AssertionError("fresh cache should be reused")
+            return [{"id": "sell-1", "price": "10.0"}]
 
         def lock_and_get_pay_url(self, _game, _goods_id, _order_id, _price):
             return {
@@ -404,22 +404,206 @@ def test_explicit_payment_failure_email_skips_and_clears_checkout(monkeypatch):
     assert get_unresolved_checkout() is None
 
 
-def test_payment_email_timeout_still_halts(monkeypatch):
+def test_rejected_listing_rescans_and_locks_the_next_sell_order(monkeypatch):
+    class BuffClient:
+        _pay_method = "alipay"
+
+        def __init__(self):
+            self.locked = []
+
+        def get_sell_orders(self, _goods_id, _game):
+            return [
+                {"id": "sell-1", "price": "10.0"},
+                {"id": "sell-2", "price": "10.0"},
+            ]
+
+        def lock_and_get_pay_url(self, _game, _goods_id, order_id, _price):
+            self.locked.append(order_id)
+            if order_id == "sell-1":
+                return {"success": False, "code": "FAIL", "created": False, "msg": "sold"}
+            return {
+                "success": True,
+                "order_id": "bill-2",
+                "pay_url": "https://pay.invalid/2",
+                "pay_type": "alipay",
+            }
+
+        def ask_seller_to_send(self, *_args):
+            return True
+
+    monkeypatch.setattr(steps, "_fetch_smart_market_price", lambda *_args, **_kwargs: None)
+    client = BuffClient()
+    kwargs, _pending, purchases = _checkout_args(wait_result=True)
+
+    result = steps.lock_and_confirm_payment(
+        client,
+        _item([
+            {"id": "sell-1", "price": "10.0"},
+            {"id": "sell-2", "price": "10.0"},
+        ]),
+        _config(),
+        **kwargs,
+    )
+
+    assert result == 10.0
+    assert client.locked == ["sell-1", "sell-2"]
+    assert [row["buff_sell_order_id"] for row in purchases] == ["sell-2"]
+
+
+def test_payment_failure_rescans_and_buys_the_next_listing(monkeypatch):
+    class BuffClient:
+        _pay_method = "alipay"
+
+        def __init__(self):
+            self.locked = []
+
+        def get_sell_orders(self, _goods_id, _game):
+            return [
+                {"id": "sell-1", "price": "10.0"},
+                {"id": "sell-2", "price": "10.0"},
+            ]
+
+        def lock_and_get_pay_url(self, _game, _goods_id, order_id, _price):
+            self.locked.append(order_id)
+            return {
+                "success": True,
+                "order_id": f"bill-{order_id}",
+                "pay_url": "https://pay.invalid/next",
+                "pay_type": "alipay",
+            }
+
+        def ask_seller_to_send(self, *_args):
+            return True
+
+    confirmed = threading.Event()
+    waits = {"n": 0}
+
+    def confirm(_ok):
+        confirmed.set()
+
+    def wait(**_kwargs):
+        waits["n"] += 1
+        if waits["n"] == 1:
+            assert confirmed.wait(2)
+            return False
+        return True
+
+    monkeypatch.setattr(steps, "wait_email_command", lambda *_args, **_kwargs: "fail")
+    monkeypatch.setattr(steps, "_fetch_smart_market_price", lambda *_args, **_kwargs: None)
+    kwargs, _pending, purchases = _checkout_args()
+    kwargs["confirm_payment"] = confirm
+    kwargs["wait_payment_confirm"] = wait
+    config = _config()
+    config["notify"] = {
+        "email_user": "buyer@qq.com",
+        "email_pass": "secret",
+        "email_timeout_seconds": 5,
+    }
+    client = BuffClient()
+
+    result = steps.lock_and_confirm_payment(
+        client,
+        _item([
+            {"id": "sell-1", "price": "10.0"},
+            {"id": "sell-2", "price": "10.0"},
+        ]),
+        config,
+        **kwargs,
+    )
+
+    assert result == 10.0
+    assert client.locked == ["sell-1", "sell-2"]
+    assert [row["buff_sell_order_id"] for row in purchases] == ["sell-2"]
+
+
+def test_rescan_skips_item_when_refreshed_price_exceeds_tolerance():
+    class BuffClient:
+        _pay_method = "alipay"
+
+        def __init__(self):
+            self.locked = []
+
+        def get_sell_orders(self, _goods_id, _game):
+            return [{"id": "sell-2", "price": "11.0"}]
+
+        def lock_and_get_pay_url(self, _game, _goods_id, order_id, _price):
+            self.locked.append(order_id)
+            return {"success": False, "code": "FAIL", "created": False}
+
+    client = BuffClient()
+    kwargs, _pending, _purchases = _checkout_args()
+
+    result = steps.lock_and_confirm_payment(
+        client,
+        _item([
+            {"id": "sell-1", "price": "10.0"},
+            {"id": "sell-2", "price": "10.0"},
+        ]),
+        _config(),
+        **kwargs,
+    )
+
+    assert result is None
+    assert client.locked == ["sell-1"]
+
+
+def test_unknown_lock_result_rescans_the_remaining_sell_order():
     from app.services.buff_checkout_guard import get_unresolved_checkout
 
     class BuffClient:
         _pay_method = "alipay"
 
+        def __init__(self):
+            self.locked = []
+
         def get_sell_orders(self, _goods_id, _game):
-            raise AssertionError("fresh cache should be reused")
+            return [
+                {"id": "sell-1", "price": "10.0"},
+                {"id": "sell-2", "price": "10.0"},
+            ]
+
+        def lock_and_get_pay_url(self, _game, _goods_id, order_id, _price):
+            self.locked.append(order_id)
+            return None
+
+    client = BuffClient()
+    kwargs, _pending, _purchases = _checkout_args()
+
+    result = steps.lock_and_confirm_payment(
+        client,
+        _item([{"id": "sell-1", "price": "10.0"}, {"id": "sell-2", "price": "10.0"}]),
+        _config(),
+        **kwargs,
+    )
+
+    assert result is None
+    assert client.locked == ["sell-1", "sell-2"]
+    assert get_unresolved_checkout() is None
+
+
+def test_payment_email_timeout_skips_item_and_clears_checkout(monkeypatch):
+    from app.services.buff_checkout_guard import get_unresolved_checkout
+
+    class BuffClient:
+        _pay_method = "alipay"
+
+        def __init__(self):
+            self.lock_calls = 0
+
+        def get_sell_orders(self, _goods_id, _game):
+            raise AssertionError("payment timeout must not rescan listings")
 
         def lock_and_get_pay_url(self, _game, _goods_id, _order_id, _price):
+            self.lock_calls += 1
             return {
                 "success": True,
                 "order_id": "bill-timeout",
                 "pay_url": "https://pay.invalid/timeout",
                 "pay_type": "alipay",
             }
+
+        def ask_seller_to_send(self, *_args):
+            raise AssertionError("timed out payment must not prompt shipping")
 
     confirm, wait = _payment_email_callbacks()
     kwargs, _pending, purchases = _checkout_args()
@@ -432,18 +616,51 @@ def test_payment_email_timeout_still_halts(monkeypatch):
         "email_pass": "secret",
         "email_timeout_seconds": 5,
     }
+    client = BuffClient()
 
-    with pytest.raises(steps.PurchaseOrderCreatedPending) as exc_info:
-        steps.lock_and_confirm_payment(
-            BuffClient(),
-            _item([{"id": "sell-1", "price": "10.0"}]),
-            config,
-            **kwargs,
-        )
+    result = steps.lock_and_confirm_payment(
+        client,
+        _item([{"id": "sell-1", "price": "10.0"}]),
+        config,
+        **kwargs,
+    )
 
-    assert exc_info.value.order_id == "bill-timeout"
+    assert result is steps.PAYMENT_TIMED_OUT
+    assert client.lock_calls == 1
     assert purchases == []
-    assert get_unresolved_checkout() is not None
+    assert get_unresolved_checkout() is None
+
+
+def test_payment_wait_deadline_skips_item_and_clears_checkout():
+    from app.services.buff_checkout_guard import get_unresolved_checkout
+
+    class BuffClient:
+        _pay_method = "alipay"
+
+        def lock_and_get_pay_url(self, *_args):
+            return {
+                "success": True,
+                "order_id": "bill-deadline",
+                "pay_url": "https://pay.invalid/deadline",
+                "pay_type": "alipay",
+            }
+
+        def ask_seller_to_send(self, *_args):
+            raise AssertionError("timed out payment must not prompt shipping")
+
+    kwargs, _pending, purchases = _checkout_args()
+    kwargs["wait_payment_confirm"] = lambda **_kwargs: None
+
+    result = steps.lock_and_confirm_payment(
+        BuffClient(),
+        _item([{"id": "sell-1", "price": "10.0"}]),
+        _config(),
+        **kwargs,
+    )
+
+    assert result is steps.PAYMENT_TIMED_OUT
+    assert purchases == []
+    assert get_unresolved_checkout() is None
 
 
 def test_rate_limit_is_not_swallowed_or_retried():
@@ -642,15 +859,18 @@ def test_transport_unknown_write_is_converted_to_terminal_purchase_state():
     client = BuffClient()
     kwargs, _pending, _purchases = _checkout_args()
 
-    with pytest.raises(steps.PurchaseWriteResultUnknown, match="socket closed"):
-        steps.lock_and_confirm_payment(
-            client,
-            _item([{"id": "sell-1", "price": "10.0"}]),
-            _config(),
-            **kwargs,
-        )
+    result = steps.lock_and_confirm_payment(
+        client,
+        _item([{"id": "sell-1", "price": "10.0"}]),
+        _config(),
+        **kwargs,
+    )
 
+    from app.services.buff_checkout_guard import get_unresolved_checkout
+
+    assert result is None
     assert client.lock_calls == 1
+    assert get_unresolved_checkout() is None
 
 
 def test_batch_payment_cancel_does_not_fallback_to_single_order():
@@ -714,7 +934,10 @@ def test_unknown_batch_result_does_not_fallback_to_single_order():
             self.single_calls = 0
 
         def get_sell_orders(self, _goods_id, _game):
-            raise AssertionError("fresh cache should be reused")
+            return [
+                {"id": "sell-1", "price": "10.0"},
+                {"id": "sell-2", "price": "10.0"},
+            ]
 
         def try_batch_buy(self, *_args):
             return None
@@ -726,18 +949,21 @@ def test_unknown_batch_result_does_not_fallback_to_single_order():
     client = BuffClient()
     kwargs, _pending, _purchases = _checkout_args()
 
-    with pytest.raises(steps.PurchaseWriteResultUnknown) as exc_info:
-        steps.lock_and_confirm_payment(
-            client,
-            _item([
-                {"id": "sell-1", "price": "10.0"},
-                {"id": "sell-2", "price": "10.0"},
-            ]),
-            _config("wechat"),
-            **kwargs,
-        )
+    result = steps.lock_and_confirm_payment(
+        client,
+        _item([
+            {"id": "sell-1", "price": "10.0"},
+            {"id": "sell-2", "price": "10.0"},
+        ]),
+        _config("wechat"),
+        **kwargs,
+    )
 
+    from app.services.buff_checkout_guard import get_unresolved_checkout
+
+    assert result is None
     assert client.single_calls == 0
+    assert get_unresolved_checkout() is None
 
 
 def test_explicitly_unsupported_batch_can_fallback_once():
@@ -749,7 +975,10 @@ def test_explicitly_unsupported_batch_can_fallback_once():
             self.single_calls = 0
 
         def get_sell_orders(self, _goods_id, _game):
-            raise AssertionError("fresh cache should be reused")
+            return [
+                {"id": "sell-1", "price": "10.0"},
+                {"id": "sell-2", "price": "10.0"},
+            ]
 
         def try_batch_buy(self, *_args):
             self.batch_calls += 1
@@ -774,7 +1003,7 @@ def test_explicitly_unsupported_batch_can_fallback_once():
 
     assert result is None
     assert client.batch_calls == 0
-    assert client.single_calls == 1
+    assert client.single_calls == 2
 
 
 def test_client_without_batch_support_falls_back_to_one_single_post():
@@ -856,33 +1085,25 @@ def test_trusted_not_created_batch_response_can_fallback_once():
     assert client.single_calls == 1
 
 
-def test_unknown_write_result_stops_entire_pipeline_with_explicit_status(monkeypatch):
+def test_cooling_message_waits_ten_minutes_then_can_continue(monkeypatch):
+    from app.services.buff_checkout_guard import get_unresolved_checkout
+
     item = _item([{"id": "sell-1", "price": "10.0"}])
     state = _FakeState()
+    delays = []
 
     class BuffClient:
         _pay_method = "alipay"
 
-        def __init__(self):
-            self.lock_calls = 0
-
         def lock_and_get_pay_url(self, *_args):
-            self.lock_calls += 1
-            return {
-                "success": False,
-                "code": "UNKNOWN_AFTER_SEND",
-                "created": None,
-            }
+            return {"success": False, "code": "COOLING_DOWN", "msg": "冷却"}
 
-    class ProxyManager:
-        def is_proxy_enabled(self):
-            return False
+    def wait_retry(self, secs):
+        delays.append(secs)
+        self.set_status("stopped", "已停止")
+        return True
 
-    class NetworkChecker:
-        def report_success(self):
-            return None
-
-    client = BuffClient()
+    monkeypatch.setattr(pipeline_module.PipelineContext, "wait_retry", wait_retry)
     monkeypatch.setattr(pipeline_module, "get_state", lambda: state)
     monkeypatch.setattr(
         pipeline_module,
@@ -900,10 +1121,14 @@ def test_unknown_write_result_stops_entire_pipeline_with_explicit_status(monkeyp
     monkeypatch.setattr(
         pipeline_module,
         "create_buff_client_from_config",
-        lambda *_args, **_kwargs: client,
+        lambda *_args, **_kwargs: BuffClient(),
     )
-    monkeypatch.setattr(pipeline_module, "get_proxy_manager", ProxyManager)
-    monkeypatch.setattr(pipeline_module, "get_network_checker", NetworkChecker)
+    monkeypatch.setattr(pipeline_module, "get_proxy_manager", lambda: type("P", (), {"is_proxy_enabled": lambda self: False})())
+    monkeypatch.setattr(
+        pipeline_module,
+        "get_network_checker",
+        lambda: type("N", (), {"report_success": lambda self: None, "report_failure": lambda self, **_k: False})(),
+    )
     monkeypatch.setattr(
         pipeline_module,
         "_fetch_and_filter_deals",
@@ -919,9 +1144,63 @@ def test_unknown_write_result_stops_entire_pipeline_with_explicit_status(monkeyp
 
     pipeline_module._run_pipeline({"pipeline": {"target_balance": 100}})
 
+    assert delays == [600]
+    assert get_unresolved_checkout() is None
+    assert state.status[1] != "BUFF_COOLING_DOWN"
+    assert any("10 分钟后继续购买" in entry[0] for entry in state.logs)
+
+
+def test_unknown_write_result_skips_item_without_stopping_purchase(monkeypatch):
+    item = _item([{"id": "sell-1", "price": "10.0"}])
+    state = _FakeState()
+    ctx = _FakeContext(state)
+    picks = {"n": 0}
+
+    class BuffClient:
+        _pay_method = "alipay"
+
+        def __init__(self):
+            self.lock_calls = 0
+
+        def get_sell_orders(self, _goods_id, _game):
+            return [{"id": "sell-1", "price": "10.0"}]
+
+        def lock_and_get_pay_url(self, *_args):
+            self.lock_calls += 1
+            return {
+                "success": False,
+                "code": "UNKNOWN_AFTER_SEND",
+                "created": None,
+            }
+
+    def pick(*_args, **_kwargs):
+        picks["n"] += 1
+        if picks["n"] == 1:
+            return item, set()
+        return None, set()
+
+    client = BuffClient()
+    monkeypatch.setattr(pipeline_module, "pick_stable_item", pick)
+
+    acc, bought, stopped = pipeline_module._process_deals_for_target(
+        ctx,
+        [item],
+        _config(),
+        100.0,
+        0.0,
+        0,
+        object(),
+        object(),
+        client,
+        set(),
+        set(),
+        set(),
+    )
+
+    assert (acc, bought, stopped) == (0.0, 0, False)
     assert client.lock_calls == 1
-    assert state.status == ("error", "BUFF_WRITE_RESULT_UNKNOWN")
-    assert any("停止全部后续购买请求" in entry[0] for entry in state.logs)
+    assert any("锁单/确认未成功" in entry[0] for entry in state.logs)
+    assert not any("停止全部后续购买请求" in entry[0] for entry in state.logs)
 
 
 def test_purchase_amount_is_counted_when_post_commit_shipping_prompt_is_blocked(monkeypatch):
@@ -1197,6 +1476,10 @@ def test_cooling_down_has_dedicated_terminal_state():
             **kwargs,
         )
 
+    from app.services.buff_checkout_guard import get_unresolved_checkout
+
+    assert get_unresolved_checkout() is None
+
 
 def test_expired_snapshot_immediately_before_write_sends_no_post(monkeypatch):
     class BuffClient:
@@ -1274,26 +1557,35 @@ def test_pending_payment_is_cleared_when_wait_callback_raises():
     assert pending[-1] is None
 
 
-def test_unrecognised_non_ok_write_result_stays_unresolved():
+def test_unrecognised_non_ok_write_result_rescans_and_skips_when_nothing_remains():
     class BuffClient:
         _pay_method = "alipay"
 
-        def lock_and_get_pay_url(self, *_args):
-            return {"success": False, "code": "NEW_SERVER_STATE", "msg": "unknown"}
+        def __init__(self):
+            self.locked = []
 
+        def get_sell_orders(self, _goods_id, _game):
+            return [{"id": "sell-1", "price": "10.0"}]
+
+        def lock_and_get_pay_url(self, _game, _goods_id, order_id, _price):
+            self.locked.append(order_id)
+            return {"success": False, "code": "FAIL", "msg": "该饰品已经被购买，请选购其他饰品"}
+
+    client = BuffClient()
     kwargs, _pending, _purchases = _checkout_args()
 
-    with pytest.raises(steps.PurchaseWriteResultUnknown):
-        exc_info = steps.lock_and_confirm_payment(
-            BuffClient(),
-            _item([{"id": "sell-1", "price": "10.0"}]),
-            _config(),
-            **kwargs,
-        )
+    result = steps.lock_and_confirm_payment(
+        client,
+        _item([{"id": "sell-1", "price": "10.0"}]),
+        _config(),
+        **kwargs,
+    )
 
     from app.services.buff_checkout_guard import get_unresolved_checkout
 
-    assert get_unresolved_checkout()["stage"] == "write_result_unknown"
+    assert result is None
+    assert client.locked == ["sell-1"]
+    assert get_unresolved_checkout() is None
 
 
 def test_single_order_id_is_durable_before_payment_link_fetch_can_crash():
@@ -1700,8 +1992,8 @@ def test_batch_fallback_refetches_snapshot_instead_of_skipping_the_purchase():
         client, item, _config(),
         log_fn=lambda msg, _level: logs.append(msg), **kwargs)
 
-    assert client.refreshes == 1
-    assert client.lock_calls == 1
+    assert client.refreshes == 3
+    assert client.lock_calls == 2
     assert not any("本次不发送锁单请求" in msg for msg in logs)
 
 
@@ -1778,7 +2070,7 @@ def test_refreshed_batch_recalculates_quantity_and_mode(
     kwargs, _, _ = _checkout_args()
     kwargs["target_balance"] = budget
     steps.lock_and_confirm_payment(BuffClient(), item, config, **kwargs)
-    assert len(attempts) == 1
+    assert attempts
     mode, unit_price, quantity, sell_ids = attempts[0]
     assert unit_price * quantity <= budget, attempts
     assert (mode, quantity) == (expected_mode, expected_quantity)

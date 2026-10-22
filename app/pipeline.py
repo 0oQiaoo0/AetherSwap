@@ -20,6 +20,7 @@ from app.pipeline_steps import (
     PurchaseOrderCreatedPending,
     PurchaseWriteResultUnknown,
     PAYMENT_FAILED,
+    PAYMENT_TIMED_OUT,
     TIME_WINDOW_CLOSED,
     filter_iflow_rows,
     lock_and_confirm_payment,
@@ -33,6 +34,7 @@ from app.services.buff_checkout_guard import (
     acknowledge_checkout,
     buff_activity_guard,
     get_unresolved_checkout,
+    resolve_checkout,
     update_checkout,
 )
 from app.services.steam_client import SteamClient
@@ -246,6 +248,12 @@ def _process_deals_for_target(
             if gid is not None:
                 failed_goods_ids.add(gid)
             ctx.log("邮件确认付款失败，跳过本件", "warn", category="buff")
+            continue
+        if paid is PAYMENT_TIMED_OUT:
+            gid = chosen.get("goods_id")
+            if gid is not None:
+                failed_goods_ids.add(gid)
+            ctx.log("付款超时，跳过本件", "warn", category="buff")
             continue
         if paid is TIME_WINDOW_CLOSED:
             ctx.log("发送购买请求前时间窗已关闭，本件未下单", "info", category="pipeline")
@@ -492,14 +500,20 @@ def _run_pipeline(config: dict) -> None:
             ctx.set_status("error", "BUFF_ORDER_CREATED_PENDING")
             return
         except PurchaseCoolingDown as e:
-            update_checkout(
-                stage="write_result_unknown",
-                reason=str(e) or "Buff 处于冷却状态",
-                last_error_type=type(e).__name__,
+            resolve_checkout(str(e) or "Buff 冷却，10 分钟后继续购买")
+            ctx.log(
+                f"{e or 'Buff 处于冷却状态'}；10 分钟后继续购买",
+                "warn",
+                category="buff",
             )
-            ctx.log(str(e) or "Buff 处于冷却状态", "error", category="buff")
-            ctx.set_status("error", "BUFF_COOLING_DOWN")
-            return
+            ctx.set_status(
+                "running",
+                "BUFF_COOLING_WAIT",
+                progress_item="10 分钟后继续购买",
+            )
+            if ctx.wait_retry(10 * 60):
+                return
+            continue
         except BuffAuthExpired:
             ctx.state.set_buff_auth_expired(True)
             ctx.log("Buff 登录已过期，请在界面重新登录", "error", category="buff")

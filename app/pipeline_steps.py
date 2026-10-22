@@ -36,8 +36,10 @@ STEAM_FEE_FACTOR = 1.15  # Steam take rate for calculating net proceeds
 BUFF_ORDERS_CACHE_TTL_SECONDS = 3.0
 TIME_WINDOW_CLOSED = object()
 PAYMENT_FAILED = object()
+PAYMENT_TIMED_OUT = object()
 PAYMENT_WAIT_SUCCESS = "success"
 PAYMENT_WAIT_FAILED = "failed"
+PAYMENT_WAIT_TIMEOUT = "timeout"
 PAYMENT_WAIT_UNCONFIRMED = "unconfirmed"
 CURRENCY_QUANTUM = Decimal("0.01")
 
@@ -75,6 +77,7 @@ class _PurchaseAttemptStatus(Enum):
     SKIP_NO_FAILED = "skip_no_failed"
     SKIP_VERIFICATION_FAILED = "skip_verification_failed"
     PAYMENT_FAILED = "payment_failed"
+    PAYMENT_TIMED_OUT = "payment_timed_out"
     FAILED = "failed"
 
 
@@ -169,6 +172,7 @@ class _PurchaseAttempt:
     reason: str = ""
     order_id: str = ""
     batch_id: str = ""
+    sell_order_ids: Tuple[str, ...] = ()
 
 
 def _checkout_credential_identity(buff_client: Any) -> Dict[str, Any]:
@@ -1042,8 +1046,9 @@ def _do_payment_notify_and_wait(
 ) -> bool:
     """Handle notification and wait for user payment confirmation.
 
-    Returns PAYMENT_WAIT_SUCCESS, PAYMENT_WAIT_FAILED, or
-    PAYMENT_WAIT_UNCONFIRMED. Only an explicit payment-failure email is FAILED.
+    Returns PAYMENT_WAIT_SUCCESS, PAYMENT_WAIT_FAILED, PAYMENT_WAIT_TIMEOUT,
+    or PAYMENT_WAIT_UNCONFIRMED. An explicit failure email is FAILED.
+    Email timeout, or the no-email wait reaching its deadline, is TIMEOUT.
     """
     name = item.get("name", "")
     set_pending_payment({
@@ -1105,6 +1110,8 @@ def _do_payment_notify_and_wait(
             wait_status = PAYMENT_WAIT_UNCONFIRMED
         elif email_result["value"] == "fail":
             wait_status = PAYMENT_WAIT_FAILED
+        elif email_result["value"] == "timeout" or ok is None:
+            wait_status = PAYMENT_WAIT_TIMEOUT
         else:
             wait_status = PAYMENT_WAIT_UNCONFIRMED
         if log_fn:
@@ -1141,12 +1148,14 @@ def _do_batch_wait_finalize_and_append(
     )
     if wait_status == PAYMENT_WAIT_FAILED and not is_stop_requested():
         return PAYMENT_FAILED
+    if wait_status == PAYMENT_WAIT_TIMEOUT and not is_stop_requested():
+        return PAYMENT_TIMED_OUT
     if is_stop_requested() or wait_status != PAYMENT_WAIT_SUCCESS:
         update_checkout(
             expected_intent_id=checkout_intent_id,
             stage="batch_created_pending",
             batch_id=str(batch_id),
-            reason="用户取消、超时或付款状态未确认",
+            reason="用户取消或付款状态未确认",
         )
         return None
     if log_fn:
@@ -1389,6 +1398,8 @@ def _do_wait_payment_and_append(
     )
     if wait_status == PAYMENT_WAIT_FAILED and not is_stop_requested():
         return PAYMENT_FAILED
+    if wait_status == PAYMENT_WAIT_TIMEOUT and not is_stop_requested():
+        return PAYMENT_TIMED_OUT
     if is_stop_requested() or wait_status != PAYMENT_WAIT_SUCCESS:
         return None
     if market_price is None:
@@ -1647,6 +1658,65 @@ def lock_and_confirm_payment(
             batch_id=batch_id,
         )
 
+    excluded_sell_order_ids: Set[str] = set()
+
+    def _orders_without_excluded(source: list) -> list:
+        if not excluded_sell_order_ids:
+            return list(source or [])
+        kept = []
+        for order in source or []:
+            sell_id = str(order.get("id") or "")
+            if sell_id and sell_id in excluded_sell_order_ids:
+                continue
+            kept.append(order)
+        return kept
+
+    def _attach_failed_listing(
+        attempt: _PurchaseAttempt,
+        *sell_ids: str,
+    ) -> _PurchaseAttempt:
+        if (
+            attempt.status is _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND
+            and (attempt.order_id or attempt.batch_id)
+        ):
+            return attempt
+        if attempt.status not in (
+            _PurchaseAttemptStatus.FAILED,
+            _PurchaseAttemptStatus.PAYMENT_FAILED,
+            _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
+        ):
+            return attempt
+        ids = tuple(str(sell_id) for sell_id in sell_ids if sell_id)
+        if not ids:
+            return attempt
+        return _PurchaseAttempt(
+            status=attempt.status,
+            amount=attempt.amount,
+            reason=attempt.reason,
+            order_id=attempt.order_id,
+            batch_id=attempt.batch_id,
+            sell_order_ids=ids,
+        )
+
+    def _lowest_listing_ids(limit: int) -> Tuple[str, ...]:
+        selected: List[str] = []
+        seen: Set[str] = set()
+        for row in orders:
+            sell_id = str(row.get("id") or "").strip()
+            if not sell_id or sell_id == "0" or sell_id in seen:
+                continue
+            try:
+                price = float(row.get("price", 0))
+            except (TypeError, ValueError):
+                continue
+            if price <= 0 or price - float(lowest_price) > 1e-6:
+                continue
+            selected.append(sell_id)
+            seen.add(sell_id)
+            if len(selected) >= limit:
+                break
+        return tuple(selected)
+
     def _prepare_purchase_plan() -> Optional[_PurchaseAttempt]:
         """Refresh stale quotes and recompute every price-dependent limit."""
         nonlocal orders, lowest_price, count_at_lowest, num_to_buy
@@ -1656,7 +1726,8 @@ def lock_and_confirm_payment(
             purchases_snapshot = get_purchases()
             holdings = [p for p in purchases_snapshot if not (p.get("sale_price") and float(p.get("sale_price", 0) or 0) > 0)]
             held_same = sum(1 for p in holdings if (p.get("name") or "").strip() == market_hash_name)
-        if not _buff_orders_cache_is_fresh(item, orders_cache_ttl):
+        refreshed = not _buff_orders_cache_is_fresh(item, orders_cache_ttl)
+        if refreshed:
             if log_fn:
                 log_fn(
                     f"[Buff]   → 卖单快照已超过 {orders_cache_ttl:.1f} 秒 TTL，重新拉取后再决定是否锁单",
@@ -1675,12 +1746,20 @@ def lock_and_confirm_payment(
                 )
             orders = refreshed_orders
             _cache_buff_sell_orders(item, orders)
+        orders = _orders_without_excluded(orders)
+        if not orders:
             if log_fn:
-                refreshed_price, refreshed_count = count_lowest_price_orders(orders)
-                log_fn(
-                    f"[Buff]   → 已刷新卖单快照 → 最低价={refreshed_price:.2f} 同价数量={refreshed_count}",
-                    "info",
-                )
+                log_fn("[Buff]   → 排除已失败卖单后没有剩余卖单，跳过本件", "warn")
+            return _PurchaseAttempt(
+                _PurchaseAttemptStatus.FAILED,
+                reason="排除已失败卖单后没有剩余卖单",
+            )
+        if refreshed and log_fn:
+            refreshed_price, refreshed_count = count_lowest_price_orders(orders)
+            log_fn(
+                f"[Buff]   → 已刷新卖单快照 → 最低价={refreshed_price:.2f} 同价数量={refreshed_count}",
+                "info",
+            )
         lowest_price, count_at_lowest = count_lowest_price_orders(orders)
         if lowest_price <= 0 or count_at_lowest <= 0:
             if log_fn:
@@ -1771,10 +1850,28 @@ def lock_and_confirm_payment(
             expected_intent_id=checkout_intent_id,
         )
         if log_fn:
-            log_fn("[Buff]   → 邮件确认付款失败，跳过本件并继续购买", "warn")
+            log_fn("[Buff]   → 邮件确认付款失败，放弃该卖单", "warn")
         return _PurchaseAttempt(
             _PurchaseAttemptStatus.PAYMENT_FAILED,
             reason="邮件确认付款失败",
+            order_id=order_id,
+            batch_id=batch_id,
+        )
+
+    def _payment_timed_out(
+        checkout_intent_id: str,
+        order_id: str = "",
+        batch_id: str = "",
+    ) -> _PurchaseAttempt:
+        resolve_checkout(
+            "付款超时，Buff 取消该订单",
+            expected_intent_id=checkout_intent_id,
+        )
+        if log_fn:
+            log_fn("[Buff]   → 付款超时，Buff 取消该订单，跳过本件并继续购买", "warn")
+        return _PurchaseAttempt(
+            _PurchaseAttemptStatus.PAYMENT_TIMED_OUT,
+            reason="付款超时",
             order_id=order_id,
             batch_id=batch_id,
         )
@@ -1789,6 +1886,7 @@ def lock_and_confirm_payment(
                 _PurchaseAttemptStatus.FAILED,
                 reason="未找到最低价卖单",
             )
+        sell_order_id = str(o.get("id") or "")
         p = float(o.get("price", 0))
         if not _time_window_is_open():
             return _PurchaseAttempt(
@@ -1818,13 +1916,16 @@ def lock_and_confirm_payment(
                         preparation_info = (
                             preparation if isinstance(preparation, dict) else {}
                         )
-                        return _PurchaseAttempt(
-                            _PurchaseAttemptStatus.FAILED,
-                            reason=str(
-                                preparation_info.get("msg")
-                                or preparation_info.get("code")
-                                or "BUFF 购买预检未通过"
+                        return _attach_failed_listing(
+                            _PurchaseAttempt(
+                                _PurchaseAttemptStatus.FAILED,
+                                reason=str(
+                                    preparation_info.get("msg")
+                                    or preparation_info.get("code")
+                                    or "BUFF 购买预检未通过"
+                                ),
                             ),
+                            sell_order_id,
                         )
                     prepared_preview = preparation.get("preview")
                 identity = _checkout_credential_identity(buff_client)
@@ -1886,19 +1987,29 @@ def lock_and_confirm_payment(
                             o["price"],
                         )
                 except BuffWriteResultUnknown as e:
-                    update_checkout(
-                        expected_intent_id=checkout_intent_id,
-                        stage="write_result_unknown",
-                        order_id=str(getattr(e, "order_id", "") or ""),
-                        reason=str(e) or "锁单写请求结果未知",
-                        last_error_type=type(e).__name__,
-                    )
+                    unknown_order_id = str(getattr(e, "order_id", "") or "")
+                    if unknown_order_id:
+                        update_checkout(
+                            expected_intent_id=checkout_intent_id,
+                            stage="write_result_unknown",
+                            order_id=unknown_order_id,
+                            reason=str(e) or "锁单写请求结果未知",
+                            last_error_type=type(e).__name__,
+                        )
+                    else:
+                        resolve_checkout(
+                            "结果未知且没有订单号，重新扫描本件卖单",
+                            expected_intent_id=checkout_intent_id,
+                        )
                     if log_fn:
                         log_fn(f"[Buff]   → 锁单写请求结果未知: {e}", "warn")
-                    return _PurchaseAttempt(
-                        _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
-                        reason=str(e) or "锁单写请求结果未知",
-                        order_id=str(getattr(e, "order_id", "") or ""),
+                    return _attach_failed_listing(
+                        _PurchaseAttempt(
+                            _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
+                            reason=str(e) or "锁单写请求结果未知",
+                            order_id=unknown_order_id,
+                        ),
+                        sell_order_id,
                     )
                 except (BuffAuthExpired, BuffRequestBlocked):
                     # A failed preflight is blocked before POST.  BUFF's exact
@@ -1911,24 +2022,38 @@ def lock_and_confirm_payment(
                     )
                     raise
                 except Exception as e:
-                    update_checkout(
+                    resolve_checkout(
+                        "结果未知且没有订单号，重新扫描本件卖单",
                         expected_intent_id=checkout_intent_id,
-                        stage="write_result_unknown",
-                        reason=str(e) or "锁单网络/接口异常",
-                        last_error_type=type(e).__name__,
                     )
                     if log_fn:
                         log_fn(f"[Buff]   → 锁单网络/接口异常: {e}", "warn")
-                    return _PurchaseAttempt(
-                        _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
-                        reason=str(e) or "锁单网络/接口异常",
+                    return _attach_failed_listing(
+                        _PurchaseAttempt(
+                            _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
+                            reason=str(e) or "锁单网络/接口异常",
+                        ),
+                        sell_order_id,
                     )
         if not result or not result.get("success"):
             attempt = _classify_failure(result)
-            if attempt.status in {
+            if (
+                attempt.status is _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND
+                and not attempt.order_id
+                and not attempt.batch_id
+            ):
+                resolve_checkout(
+                    "结果未知且没有订单号，重新扫描本件卖单",
+                    expected_intent_id=checkout_intent_id,
+                )
+            elif attempt.status is _PurchaseAttemptStatus.COOLING_DOWN:
+                resolve_checkout(
+                    "Buff 冷却，10 分钟后继续购买",
+                    expected_intent_id=checkout_intent_id,
+                )
+            elif attempt.status in {
                 _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
                 _PurchaseAttemptStatus.CREATED_NOT_PAID,
-                _PurchaseAttemptStatus.COOLING_DOWN,
                 _PurchaseAttemptStatus.RISK,
             }:
                 update_checkout(
@@ -1950,18 +2075,20 @@ def lock_and_confirm_payment(
                 code_str = result.get('code') if result else '未知'
                 msg_str = result.get('msg', '无响应内容') if result else '请求失败或超时'
                 log_fn(f"[Buff]   → 锁单失败 code={code_str} msg={msg_str}", "warn")
-            return attempt
+            return _attach_failed_listing(attempt, sell_order_id)
         order_id = str(result.get("order_id") or "")
         pay_url = str(result.get("pay_url") or "")
         if not order_id:
-            update_checkout(
+            resolve_checkout(
+                "结果未知且没有订单号，重新扫描本件卖单",
                 expected_intent_id=checkout_intent_id,
-                stage="write_result_unknown",
-                reason="锁单返回成功但缺少订单号",
             )
-            return _PurchaseAttempt(
-                _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
-                reason="锁单返回成功但缺少订单号",
+            return _attach_failed_listing(
+                _PurchaseAttempt(
+                    _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
+                    reason="锁单返回成功但缺少订单号",
+                ),
+                sell_order_id,
             )
         if not pay_url:
             identity = _checkout_credential_identity(buff_client)
@@ -2017,17 +2144,22 @@ def lock_and_confirm_payment(
             on_entering_payment=on_entering_payment,
         )
         if paid is PAYMENT_FAILED:
-            return _explicit_payment_failure(checkout_intent_id, order_id=order_id)
+            return _attach_failed_listing(
+                _explicit_payment_failure(checkout_intent_id, order_id=order_id),
+                sell_order_id,
+            )
+        if paid is PAYMENT_TIMED_OUT:
+            return _payment_timed_out(checkout_intent_id, order_id=order_id)
         if paid is None:
             update_checkout(
                 expected_intent_id=checkout_intent_id,
                 stage="order_created_pending",
                 order_id=order_id,
-                reason="用户取消、超时或付款状态未确认",
+                reason="用户取消或付款状态未确认",
             )
             return _PurchaseAttempt(
                 _PurchaseAttemptStatus.CREATED_NOT_PAID,
-                reason="订单已创建，用户取消、超时或付款状态未确认",
+                reason="订单已创建，用户取消或付款状态未确认",
                 order_id=order_id,
             )
         return _PurchaseAttempt(
@@ -2067,6 +2199,7 @@ def lock_and_confirm_payment(
                 _PurchaseAttemptStatus.TIME_WINDOW_CLOSED,
                 reason="购买时间窗已关闭",
             )
+        batch_sell_ids: Tuple[str, ...] = ()
         with get_buff_auth_lock():
             with buff_activity_guard():
                 if not _time_window_is_open():
@@ -2076,6 +2209,7 @@ def lock_and_confirm_payment(
                     )
                 _verify_checkout_session(buff_client, game_buff)
                 identity = _checkout_credential_identity(buff_client)
+                batch_sell_ids = _lowest_listing_ids(num_to_buy)
                 intent = begin_checkout(
                     "batch",
                     goods_id,
@@ -2124,22 +2258,32 @@ def lock_and_confirm_payment(
                             num_to_buy,
                         )
                 except BuffWriteResultUnknown as e:
-                    update_checkout(
-                        expected_intent_id=checkout_intent_id,
-                        stage="write_result_unknown",
-                        batch_id=str(getattr(e, "batch_id", "") or ""),
-                        reason=str(e) or "批量创建写请求结果未知",
-                        last_error_type=type(e).__name__,
-                    )
+                    unknown_batch_id = str(getattr(e, "batch_id", "") or "")
+                    if unknown_batch_id:
+                        update_checkout(
+                            expected_intent_id=checkout_intent_id,
+                            stage="write_result_unknown",
+                            batch_id=unknown_batch_id,
+                            reason=str(e) or "批量创建写请求结果未知",
+                            last_error_type=type(e).__name__,
+                        )
+                    else:
+                        resolve_checkout(
+                            "结果未知且没有订单号，重新扫描本件卖单",
+                            expected_intent_id=checkout_intent_id,
+                        )
                     if log_fn:
                         log_fn(
                             f"[Buff]   → 批量创建写请求结果未知: {e}",
                             "warn",
                         )
-                    return _PurchaseAttempt(
-                        _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
-                        reason=str(e) or "批量创建写请求结果未知",
-                        batch_id=str(getattr(e, "batch_id", "") or ""),
+                    return _attach_failed_listing(
+                        _PurchaseAttempt(
+                            _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
+                            reason=str(e) or "批量创建写请求结果未知",
+                            batch_id=unknown_batch_id,
+                        ),
+                        *batch_sell_ids,
                     )
                 except (BuffAuthExpired, BuffRequestBlocked):
                     resolve_checkout(
@@ -2148,24 +2292,38 @@ def lock_and_confirm_payment(
                     )
                     raise
                 except Exception as e:
-                    update_checkout(
+                    resolve_checkout(
+                        "结果未知且没有订单号，重新扫描本件卖单",
                         expected_intent_id=checkout_intent_id,
-                        stage="write_result_unknown",
-                        reason=str(e) or "批量购买接口异常",
-                        last_error_type=type(e).__name__,
                     )
                     if log_fn:
                         log_fn(f"[Buff]   → 批量购买接口异常: {e}", "warn")
-                    return _PurchaseAttempt(
-                        _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
-                        reason=str(e) or "批量购买接口异常",
+                    return _attach_failed_listing(
+                        _PurchaseAttempt(
+                            _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
+                            reason=str(e) or "批量购买接口异常",
+                        ),
+                        *batch_sell_ids,
                     )
         if not batch_result or not batch_result.get("success"):
             attempt = _classify_failure(batch_result)
-            if attempt.status in {
+            if (
+                attempt.status is _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND
+                and not attempt.order_id
+                and not attempt.batch_id
+            ):
+                resolve_checkout(
+                    "结果未知且没有订单号，重新扫描本件卖单",
+                    expected_intent_id=checkout_intent_id,
+                )
+            elif attempt.status is _PurchaseAttemptStatus.COOLING_DOWN:
+                resolve_checkout(
+                    "Buff 冷却，10 分钟后继续购买",
+                    expected_intent_id=checkout_intent_id,
+                )
+            elif attempt.status in {
                 _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
                 _PurchaseAttemptStatus.CREATED_NOT_PAID,
-                _PurchaseAttemptStatus.COOLING_DOWN,
                 _PurchaseAttemptStatus.RISK,
             }:
                 update_checkout(
@@ -2185,20 +2343,22 @@ def lock_and_confirm_payment(
                 )
             if log_fn:
                 log_fn(f"[Buff]   → 批量购买未完成: {attempt.reason}", "warn")
-            return attempt
+            return _attach_failed_listing(attempt, *batch_sell_ids)
         batch_id = str(batch_result.get("batch_id") or "")
         pay_url = str(batch_result.get("pay_url") or "")
         if not batch_id:
-            update_checkout(
+            resolve_checkout(
+                "结果未知且没有订单号，重新扫描本件卖单",
                 expected_intent_id=checkout_intent_id,
-                stage="write_result_unknown",
-                reason="批量接口返回成功但缺少批次号",
             )
             if log_fn:
-                log_fn("[Buff]   → 批量接口返回成功但缺少批次号，停止且不改单件", "warn")
-            return _PurchaseAttempt(
-                _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
-                reason="批量接口返回成功但缺少批次号",
+                log_fn("[Buff]   → 批量接口返回成功但缺少批次号，重新扫描本件卖单", "warn")
+            return _attach_failed_listing(
+                _PurchaseAttempt(
+                    _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
+                    reason="批量接口返回成功但缺少批次号",
+                ),
+                *batch_sell_ids,
             )
         if not pay_url:
             identity = _checkout_credential_identity(buff_client)
@@ -2283,17 +2443,22 @@ def lock_and_confirm_payment(
                 batch_id=batch_id,
             )
         if paid is PAYMENT_FAILED:
-            return _explicit_payment_failure(checkout_intent_id, batch_id=batch_id)
+            return _attach_failed_listing(
+                _explicit_payment_failure(checkout_intent_id, batch_id=batch_id),
+                *batch_sell_ids,
+            )
+        if paid is PAYMENT_TIMED_OUT:
+            return _payment_timed_out(checkout_intent_id, batch_id=batch_id)
         if paid is None:
             update_checkout(
                 expected_intent_id=checkout_intent_id,
                 stage="batch_created_pending",
                 batch_id=batch_id,
-                reason="用户取消、超时或核销状态未确认",
+                reason="用户取消或核销状态未确认",
             )
             return _PurchaseAttempt(
                 _PurchaseAttemptStatus.CREATED_NOT_PAID,
-                reason="批次已创建，用户取消、超时或核销状态未确认",
+                reason="批次已创建，用户取消或核销状态未确认",
                 batch_id=batch_id,
             )
         return _PurchaseAttempt(
@@ -2306,11 +2471,13 @@ def lock_and_confirm_payment(
         if attempt.status is _PurchaseAttemptStatus.SUCCESS:
             return attempt.amount
         if attempt.status is _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND:
-            raise PurchaseWriteResultUnknown(
-                attempt.reason or "BUFF 写请求结果未知，已停止后续购买",
-                order_id=attempt.order_id,
-                batch_id=attempt.batch_id,
-            )
+            if attempt.order_id or attempt.batch_id:
+                raise PurchaseWriteResultUnknown(
+                    attempt.reason or "BUFF 写请求结果未知，已停止后续购买",
+                    order_id=attempt.order_id,
+                    batch_id=attempt.batch_id,
+                )
+            return None
         if attempt.status is _PurchaseAttemptStatus.CREATED_NOT_PAID:
             raise PurchaseOrderCreatedPending(
                 attempt.reason or "BUFF 订单已创建但未完成，已停止后续购买",
@@ -2327,6 +2494,8 @@ def lock_and_confirm_payment(
             )
         if attempt.status is _PurchaseAttemptStatus.PAYMENT_FAILED:
             return PAYMENT_FAILED
+        if attempt.status is _PurchaseAttemptStatus.PAYMENT_TIMED_OUT:
+            return PAYMENT_TIMED_OUT
         if attempt.status is _PurchaseAttemptStatus.TIME_WINDOW_CLOSED:
             return TIME_WINDOW_CLOSED
         if attempt.status is _PurchaseAttemptStatus.TARGET_REACHED:
@@ -2337,15 +2506,49 @@ def lock_and_confirm_payment(
             return SKIP_VERIFICATION_FAILED
         return None
 
-    plan_failure = _prepare_purchase_plan()
-    if plan_failure is not None:
-        return _finish_attempt(plan_failure)
-    if num_to_buy == 1:
-        return _finish_attempt(_try_single_buy())
-
-    batch_attempt = _try_batch_buy()
-    if batch_attempt.status is _PurchaseAttemptStatus.SAFE_TO_FALLBACK:
+    # 明确拒绝、付款失败，或没有订单号的结果未知：丢掉该卖单号，重拉卖单后再锁下一张。
+    previous_attempt: Optional[_PurchaseAttempt] = None
+    while True:
+        plan_failure = _prepare_purchase_plan()
+        if plan_failure is not None:
+            if (
+                previous_attempt is not None
+                and previous_attempt.status is _PurchaseAttemptStatus.PAYMENT_FAILED
+                and plan_failure.reason == "排除已失败卖单后没有剩余卖单"
+            ):
+                return PAYMENT_FAILED
+            return _finish_attempt(plan_failure)
+        if num_to_buy == 1:
+            attempt = _try_single_buy()
+        else:
+            attempt = _try_batch_buy()
+            if attempt.status is _PurchaseAttemptStatus.SAFE_TO_FALLBACK:
+                if log_fn:
+                    log_fn(
+                        f"[Buff]   → 批量未创建，降级为单件购买: {attempt.reason}",
+                        "info",
+                    )
+                attempt = _try_single_buy()
+        retry_ids = tuple(
+            sell_id
+            for sell_id in attempt.sell_order_ids
+            if sell_id and sell_id not in excluded_sell_order_ids
+        )
+        unknown_order_exists = (
+            attempt.status is _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND
+            and bool(attempt.order_id or attempt.batch_id)
+        )
+        if attempt.status not in (
+            _PurchaseAttemptStatus.FAILED,
+            _PurchaseAttemptStatus.PAYMENT_FAILED,
+            _PurchaseAttemptStatus.UNKNOWN_AFTER_SEND,
+        ) or unknown_order_exists or not retry_ids:
+            return _finish_attempt(attempt)
+        excluded_sell_order_ids.update(retry_ids)
+        previous_attempt = attempt
         if log_fn:
-            log_fn(f"[Buff]   → 批量未创建，降级为单件购买: {batch_attempt.reason}", "info")
-        return _finish_attempt(_try_single_buy())
-    return _finish_attempt(batch_attempt)
+            log_fn(
+                f"[Buff]   → 卖单 {', '.join(retry_ids)} 未买成，重新扫描本件剩余卖单",
+                "info",
+            )
+        item["_buff_sell_orders_fetched_at"] = 0
