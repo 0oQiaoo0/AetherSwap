@@ -1,3 +1,4 @@
+import threading
 import time
 
 import pytest
@@ -344,6 +345,105 @@ def test_single_order_payment_cancel_does_not_lock_again():
     assert client.lock_calls == 1
     assert pending[-1] is None
     assert purchases == []
+
+
+def _payment_email_callbacks():
+    confirmed = threading.Event()
+
+    def confirm(_ok):
+        confirmed.set()
+
+    def wait(**_kwargs):
+        assert confirmed.wait(2)
+        return False
+
+    return confirm, wait
+
+
+def test_explicit_payment_failure_email_skips_and_clears_checkout(monkeypatch):
+    from app.services.buff_checkout_guard import get_unresolved_checkout
+
+    class BuffClient:
+        _pay_method = "alipay"
+
+        def get_sell_orders(self, _goods_id, _game):
+            raise AssertionError("fresh cache should be reused")
+
+        def lock_and_get_pay_url(self, _game, _goods_id, _order_id, _price):
+            return {
+                "success": True,
+                "order_id": "bill-fail",
+                "pay_url": "https://pay.invalid/fail",
+                "pay_type": "alipay",
+            }
+
+        def ask_seller_to_send(self, *_args):
+            raise AssertionError("failed payment must not prompt shipping")
+
+    confirm, wait = _payment_email_callbacks()
+    kwargs, _pending, purchases = _checkout_args()
+    kwargs["confirm_payment"] = confirm
+    kwargs["wait_payment_confirm"] = wait
+    monkeypatch.setattr(steps, "wait_email_command", lambda *_args, **_kwargs: "fail")
+    config = _config()
+    config["notify"] = {
+        "email_user": "buyer@qq.com",
+        "email_pass": "secret",
+        "email_timeout_seconds": 5,
+    }
+
+    result = steps.lock_and_confirm_payment(
+        BuffClient(),
+        _item([{"id": "sell-1", "price": "10.0"}]),
+        config,
+        **kwargs,
+    )
+
+    assert result is steps.PAYMENT_FAILED
+    assert purchases == []
+    assert get_unresolved_checkout() is None
+
+
+def test_payment_email_timeout_still_halts(monkeypatch):
+    from app.services.buff_checkout_guard import get_unresolved_checkout
+
+    class BuffClient:
+        _pay_method = "alipay"
+
+        def get_sell_orders(self, _goods_id, _game):
+            raise AssertionError("fresh cache should be reused")
+
+        def lock_and_get_pay_url(self, _game, _goods_id, _order_id, _price):
+            return {
+                "success": True,
+                "order_id": "bill-timeout",
+                "pay_url": "https://pay.invalid/timeout",
+                "pay_type": "alipay",
+            }
+
+    confirm, wait = _payment_email_callbacks()
+    kwargs, _pending, purchases = _checkout_args()
+    kwargs["confirm_payment"] = confirm
+    kwargs["wait_payment_confirm"] = wait
+    monkeypatch.setattr(steps, "wait_email_command", lambda *_args, **_kwargs: "timeout")
+    config = _config()
+    config["notify"] = {
+        "email_user": "buyer@qq.com",
+        "email_pass": "secret",
+        "email_timeout_seconds": 5,
+    }
+
+    with pytest.raises(steps.PurchaseOrderCreatedPending) as exc_info:
+        steps.lock_and_confirm_payment(
+            BuffClient(),
+            _item([{"id": "sell-1", "price": "10.0"}]),
+            config,
+            **kwargs,
+        )
+
+    assert exc_info.value.order_id == "bill-timeout"
+    assert purchases == []
+    assert get_unresolved_checkout() is not None
 
 
 def test_rate_limit_is_not_swallowed_or_retried():

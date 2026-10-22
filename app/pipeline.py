@@ -19,6 +19,7 @@ from app.pipeline_steps import (
     PurchaseCoolingDown,
     PurchaseOrderCreatedPending,
     PurchaseWriteResultUnknown,
+    PAYMENT_FAILED,
     TIME_WINDOW_CLOSED,
     filter_iflow_rows,
     lock_and_confirm_payment,
@@ -240,6 +241,12 @@ def _process_deals_for_target(
         if ctx.is_stop_requested():
             ctx.set_status("stopped", "已停止")
             return acc, bought, True
+        if paid is PAYMENT_FAILED:
+            gid = chosen.get("goods_id")
+            if gid is not None:
+                failed_goods_ids.add(gid)
+            ctx.log("邮件确认付款失败，跳过本件", "warn", category="buff")
+            continue
         if paid is TIME_WINDOW_CLOSED:
             ctx.log("发送购买请求前时间窗已关闭，本件未下单", "info", category="pipeline")
             return acc, bought, TIME_WINDOW_CLOSED

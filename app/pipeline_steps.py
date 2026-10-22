@@ -35,6 +35,10 @@ from buff import (
 STEAM_FEE_FACTOR = 1.15  # Steam take rate for calculating net proceeds
 BUFF_ORDERS_CACHE_TTL_SECONDS = 3.0
 TIME_WINDOW_CLOSED = object()
+PAYMENT_FAILED = object()
+PAYMENT_WAIT_SUCCESS = "success"
+PAYMENT_WAIT_FAILED = "failed"
+PAYMENT_WAIT_UNCONFIRMED = "unconfirmed"
 CURRENCY_QUANTUM = Decimal("0.01")
 
 
@@ -70,6 +74,7 @@ class _PurchaseAttemptStatus(Enum):
     TARGET_REACHED = "target_reached"
     SKIP_NO_FAILED = "skip_no_failed"
     SKIP_VERIFICATION_FAILED = "skip_verification_failed"
+    PAYMENT_FAILED = "payment_failed"
     FAILED = "failed"
 
 
@@ -1036,7 +1041,9 @@ def _do_payment_notify_and_wait(
     on_entering_payment: Optional[Callable[[], None]] = None,
 ) -> bool:
     """Handle notification and wait for user payment confirmation.
-    Returns True if user confirmed, False on cancel/timeout/stop.
+
+    Returns PAYMENT_WAIT_SUCCESS, PAYMENT_WAIT_FAILED, or
+    PAYMENT_WAIT_UNCONFIRMED. Only an explicit payment-failure email is FAILED.
     """
     name = item.get("name", "")
     set_pending_payment({
@@ -1081,18 +1088,28 @@ def _do_payment_notify_and_wait(
         email_user = (notify_cfg.get("email_user") or "").strip()
         email_pass = (notify_cfg.get("email_pass") or "").strip()
         timeout_sec = int(notify_cfg.get("email_timeout_seconds", 300))
+        email_result = {"value": ""}
         if email_user and email_pass:
             def _email_waiter() -> None:
                 res = wait_email_command(config, timeout_seconds=timeout_sec, is_stop_requested=is_stop_requested, log_fn=log_fn)
+                email_result["value"] = res
                 confirm_payment(res == "success")
             t = threading.Thread(target=_email_waiter, daemon=True)
             t.start()
             ok = wait_payment_confirm()
         else:
             ok = wait_payment_confirm(timeout_seconds=timeout_sec)
+        if ok:
+            wait_status = PAYMENT_WAIT_SUCCESS
+        elif is_stop_requested():
+            wait_status = PAYMENT_WAIT_UNCONFIRMED
+        elif email_result["value"] == "fail":
+            wait_status = PAYMENT_WAIT_FAILED
+        else:
+            wait_status = PAYMENT_WAIT_UNCONFIRMED
         if log_fn:
-            log_fn(f"[Buff]   → 用户确认={'成功' if ok else '取消/失败'}", "info")
-        return ok
+            log_fn(f"[Buff]   → 用户确认={'成功' if wait_status == PAYMENT_WAIT_SUCCESS else '取消/失败'}", "info")
+        return wait_status
     finally:
         set_pending_payment(None)
 def _do_batch_wait_finalize_and_append(
@@ -1117,12 +1134,14 @@ def _do_batch_wait_finalize_and_append(
     on_entering_payment: Optional[Callable[[], None]] = None,
     pay_type: str = "wechat",
 ) -> Optional[float]:
-    ok = _do_payment_notify_and_wait(
+    wait_status = _do_payment_notify_and_wait(
         item, config, unit_price, num, pay_url, pay_type, batch_id, acc,
         set_pending_payment, wait_payment_confirm, confirm_payment,
         is_stop_requested, log_fn, on_entering_payment,
     )
-    if is_stop_requested() or not ok:
+    if wait_status == PAYMENT_WAIT_FAILED and not is_stop_requested():
+        return PAYMENT_FAILED
+    if is_stop_requested() or wait_status != PAYMENT_WAIT_SUCCESS:
         update_checkout(
             expected_intent_id=checkout_intent_id,
             stage="batch_created_pending",
@@ -1363,12 +1382,14 @@ def _do_wait_payment_and_append(
     market_price: Optional[float] = None,
     on_entering_payment: Optional[Callable[[], None]] = None,
 ) -> Optional[float]:
-    ok = _do_payment_notify_and_wait(
+    wait_status = _do_payment_notify_and_wait(
         item, config, unit_price, num, pay_url, pay_type, order_id, acc,
         set_pending_payment, wait_payment_confirm, confirm_payment,
         is_stop_requested, log_fn, on_entering_payment,
     )
-    if is_stop_requested() or not ok:
+    if wait_status == PAYMENT_WAIT_FAILED and not is_stop_requested():
+        return PAYMENT_FAILED
+    if is_stop_requested() or wait_status != PAYMENT_WAIT_SUCCESS:
         return None
     if market_price is None:
         mhn = (item.get("steam_market_name") or item.get("name") or "").strip()
@@ -1740,6 +1761,24 @@ def lock_and_confirm_payment(
             # A broken clock/config callback must suppress a purchase write.
             return False
 
+    def _explicit_payment_failure(
+        checkout_intent_id: str,
+        order_id: str = "",
+        batch_id: str = "",
+    ) -> _PurchaseAttempt:
+        resolve_checkout(
+            "邮件确认付款失败，跳过本件",
+            expected_intent_id=checkout_intent_id,
+        )
+        if log_fn:
+            log_fn("[Buff]   → 邮件确认付款失败，跳过本件并继续购买", "warn")
+        return _PurchaseAttempt(
+            _PurchaseAttemptStatus.PAYMENT_FAILED,
+            reason="邮件确认付款失败",
+            order_id=order_id,
+            batch_id=batch_id,
+        )
+
     def _try_single_buy() -> _PurchaseAttempt:
         plan_failure = _prepare_purchase_plan()
         if plan_failure is not None:
@@ -1977,6 +2016,8 @@ def lock_and_confirm_payment(
             market_price=ref_price,
             on_entering_payment=on_entering_payment,
         )
+        if paid is PAYMENT_FAILED:
+            return _explicit_payment_failure(checkout_intent_id, order_id=order_id)
         if paid is None:
             update_checkout(
                 expected_intent_id=checkout_intent_id,
@@ -2241,6 +2282,8 @@ def lock_and_confirm_payment(
                 reason=str(e) or "批量核销写请求结果未知",
                 batch_id=batch_id,
             )
+        if paid is PAYMENT_FAILED:
+            return _explicit_payment_failure(checkout_intent_id, batch_id=batch_id)
         if paid is None:
             update_checkout(
                 expected_intent_id=checkout_intent_id,
@@ -2282,6 +2325,8 @@ def lock_and_confirm_payment(
             raise BuffVerificationRequired(
                 attempt.reason or "Buff 返回风控/验证状态，已停止后续购买请求"
             )
+        if attempt.status is _PurchaseAttemptStatus.PAYMENT_FAILED:
+            return PAYMENT_FAILED
         if attempt.status is _PurchaseAttemptStatus.TIME_WINDOW_CLOSED:
             return TIME_WINDOW_CLOSED
         if attempt.status is _PurchaseAttemptStatus.TARGET_REACHED:
