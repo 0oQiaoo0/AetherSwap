@@ -405,8 +405,7 @@ function getInventoryCache() {
     return { name: tds[0]?.textContent.trim() || "" };
   });
 }
-function aggregateByItemName(purchases, resellRatio = 0.85) {
-  const ratio = Math.max(0.01, Math.min(1, Number(resellRatio) || 0.85));
+function aggregateByItemName(purchases) {
   const byName = new Map();
   for (const t of purchases) {
     const name = (t.name || "—").toString();
@@ -420,7 +419,6 @@ function aggregateByItemName(purchases, resellRatio = 0.85) {
         soldCount: 0,
         totalSalePrice: 0,
         totalDiscountRatio: 0,
-        totalCashProfit: 0,
         totalDeviation: 0,
         totalSoldMp: 0,
         deviationCount: 0,
@@ -442,7 +440,6 @@ function aggregateByItemName(purchases, resellRatio = 0.85) {
       r.soldCount += 1;
       r.totalSalePrice += saleP;
       if (afterTax > 0 && cost > 0) r.totalDiscountRatio += cost / afterTax;
-      r.totalCashProfit += afterTax * ratio - cost;
       if (mp > 0) {
         r.totalDeviation += saleP - mp;
         r.totalSoldMp += mp;
@@ -459,45 +456,40 @@ function aggregateByItemName(purchases, resellRatio = 0.85) {
       totalSaleAmount: r.soldCount > 0 ? r.totalSalePrice : null,
       avgSalePrice: r.soldCount > 0 ? r.totalSalePrice / r.soldCount : null,
       avgDiscountRatio: r.soldCount > 0 && r.totalDiscountRatio > 0 ? r.totalDiscountRatio / r.soldCount : null,
-      totalCashProfit: r.soldCount > 0 ? r.totalCashProfit : null,
       avgDeviation: r.deviationCount > 0 ? r.totalDeviation / r.deviationCount : null,
       avgDeviationPct: r.deviationCount > 0 && r.totalSoldMp > 0 ? (r.totalDeviation / r.totalSoldMp) * 100 : null,
     }))
     .sort((a, b) => b.count - a.count);
 }
-function refreshAnalytics(purchases, resellRatio) {
+function refreshAnalytics(purchases) {
   const tbody = document.querySelector("#analytics-table tbody");
   if (!tbody) return;
-  const render = (list, ratio) => {
-    const rows = aggregateByItemName(list, ratio);
+  const render = (list) => {
+    const rows = aggregateByItemName(list);
     const rowHtmls = rows.map((r) => {
       const avgPriceStr = r.avgPrice > 0 ? r.avgPrice.toFixed(2) : "—";
       const avgMpStr = r.avgMp != null ? r.avgMp.toFixed(2) : "—";
       const totalSaleStr = r.totalSaleAmount != null ? r.totalSaleAmount.toFixed(2) : "—";
       const avgSaleStr = r.avgSalePrice != null ? r.avgSalePrice.toFixed(2) : "—";
       const avgDiscountStr = r.avgDiscountRatio != null ? r.avgDiscountRatio.toFixed(4) : "—";
-      const discountRatioClass = avgDiscountStr !== "—" ? (parseFloat(avgDiscountStr) > ratio ? "text-bad" : "text-ok") : "";
-      const cashProfitStr = r.totalCashProfit != null ? (r.totalCashProfit >= 0 ? "+" : "") + r.totalCashProfit.toFixed(2) : "—";
-      const cashClass = r.totalCashProfit != null ? (r.totalCashProfit > 0 ? "text-ok" : r.totalCashProfit < 0 ? "text-bad" : "") : "";
       const avgDevPctStr = r.avgDeviationPct != null ? (r.avgDeviationPct >= 0 ? "+" : "") + r.avgDeviationPct.toFixed(2) + "%" : "";
       const avgDevStr = r.avgDeviation != null ? (r.avgDeviation >= 0 ? "+" : "") + r.avgDeviation.toFixed(2) + (avgDevPctStr ? " (" + avgDevPctStr + ")" : "") : "—";
       const devClass = r.avgDeviation != null ? (r.avgDeviation > 0 ? "text-ok" : r.avgDeviation < 0 ? "text-bad" : "") : "";
-      return `<tr><td>${escapeHtml(r.name)}</td><td class="mono">${r.count}</td><td class="mono">${avgPriceStr}</td><td class="mono">${avgMpStr}</td><td class="mono">${totalSaleStr}</td><td class="mono">${avgSaleStr}</td><td class="mono ${discountRatioClass}">${avgDiscountStr}</td><td class="mono ${cashClass}">${cashProfitStr}</td><td class="mono ${devClass}">${avgDevStr}</td></tr>`;
+      return `<tr><td>${escapeHtml(r.name)}</td><td class="mono">${r.count}</td><td class="mono">${avgPriceStr}</td><td class="mono">${avgMpStr}</td><td class="mono">${totalSaleStr}</td><td class="mono">${avgSaleStr}</td><td class="mono">${avgDiscountStr}</td><td class="mono ${devClass}">${avgDevStr}</td></tr>`;
     });
-    tbody.innerHTML = rowHtmls.length ? rowHtmls.join("") : "<tr><td colspan='9' class='text-muted'>暂无数据</td></tr>";
+    tbody.innerHTML = rowHtmls.length ? rowHtmls.join("") : "<tr><td colspan='8' class='text-muted'>暂无数据</td></tr>";
   };
-  if (purchases != null && resellRatio != null) {
-    render(purchases, resellRatio);
+  if (purchases != null) {
+    render(purchases);
   } else {
     fetchJson(API + "/transactions?enrich_current_price=0")
       .then((d) => {
         const list = (d.transactions || []).filter((t) => t.type === "purchase");
-        const ratio = Math.max(0.01, Math.min(1, Number(d.resell_ratio) || 0.85));
-        render(list, ratio);
+        render(list);
       })
       .catch((e) => {
         toast("加载数据分析失败", e.message || "");
-        tbody.innerHTML = "<tr><td colspan='9' class='text-muted'>加载失败</td></tr>";
+        tbody.innerHTML = "<tr><td colspan='8' class='text-muted'>加载失败</td></tr>";
       });
   }
 }

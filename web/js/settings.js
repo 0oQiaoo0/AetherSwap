@@ -98,8 +98,6 @@ async function loadConfig() {
   if (maxListingsPerItem) maxListingsPerItem.value = p.max_listings_per_item ?? "";
   const listingDelayEl = el("cfg-listing_delay_seconds");
   if (listingDelayEl) listingDelayEl.value = p.listing_delay_seconds ?? "";
-  const resellRatioEl = el("cfg-resell_ratio");
-  if (resellRatioEl) resellRatioEl.value = p.resell_ratio ?? "";
   const safeHardCap = el("cfg-safe_purchase_hard_qty_cap");
   if (safeHardCap) safeHardCap.value = p.safe_purchase_hard_qty_cap ?? "";
   const safeLiqRatio = el("cfg-safe_purchase_liquidity_ratio");
@@ -244,7 +242,6 @@ function formToConfig() {
       sell_trend_days: el("cfg-sell_trend_days") ? parseInt(el("cfg-sell_trend_days").value, 10) || undefined : undefined,
       max_listings_per_item: el("cfg-max_listings_per_item") ? parseInt(el("cfg-max_listings_per_item").value, 10) || undefined : undefined,
       listing_delay_seconds: el("cfg-listing_delay_seconds") ? parseInt(el("cfg-listing_delay_seconds").value, 10) || undefined : undefined,
-      resell_ratio: el("cfg-resell_ratio") ? parseFloat(el("cfg-resell_ratio").value) || undefined : undefined,
       safe_purchase_hard_qty_cap: el("cfg-safe_purchase_hard_qty_cap") ? parseInt(el("cfg-safe_purchase_hard_qty_cap").value, 10) : undefined,
       safe_purchase_liquidity_ratio: el("cfg-safe_purchase_liquidity_ratio") ? parseFloat(el("cfg-safe_purchase_liquidity_ratio").value) : undefined,
       safe_purchase_low_price_threshold: el("cfg-safe_purchase_low_price_threshold") ? parseFloat(el("cfg-safe_purchase_low_price_threshold").value) : undefined,

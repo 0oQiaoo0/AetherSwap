@@ -177,8 +177,7 @@ def wait_email_command(
     if log_fn:
         log_fn("邮箱等待超时", "warn")
     return "timeout"
-def compute_holdings_stats(holdings: list, resell_ratio: float = 0.85) -> tuple:
-    ratio = max(0.01, min(1, float(resell_ratio) or 0.85))
+def compute_holdings_stats(holdings: list) -> tuple:
     total_price = sum(float(t.get("price", 0) or 0) for t in holdings)
     total_mp = sum(float(t.get("market_price", 0) or 0) for t in holdings if t.get("market_price") is not None)
     has_cmp = any(t.get("current_market_price") is not None for t in holdings)
@@ -196,15 +195,11 @@ def compute_holdings_stats(holdings: list, resell_ratio: float = 0.85) -> tuple:
         change_total_cmp += cmp
     pl = (change_total_cmp - change_total_mp) if change_total_mp > 0 else None
     pl_pct = (pl / change_total_mp * 100) if pl is not None and change_total_mp > 0 else None
-    return total_price, total_mp, total_cmp, pl, pl_pct, ratio
-def build_holdings_report_content(
-    holdings: list,
-    resell_ratio: float = 0.85,
-) -> str:
-    total_price, total_mp, total_cmp, pl, pl_pct, ratio = compute_holdings_stats(holdings, resell_ratio)
+    return total_price, total_mp, total_cmp, pl, pl_pct
+def build_holdings_report_content(holdings: list) -> str:
+    total_price, total_mp, total_cmp, pl, pl_pct = compute_holdings_stats(holdings)
     total_after_tax = total_cmp / 1.15 if total_cmp and total_cmp > 0 else None
     discount_ratio = (total_price / total_after_tax) if total_after_tax and total_after_tax > 0 and total_price > 0 else None
-    cash_profit = (total_after_tax * ratio - total_price) if total_after_tax is not None and total_price >= 0 else None
     self_use_profit = (total_after_tax - total_price) if total_after_tax is not None else None
     lines = [
         f"总购入价 {total_price:.2f}",
@@ -212,7 +207,6 @@ def build_holdings_report_content(
         f"总现市场价 {total_cmp:.2f}" if total_cmp is not None else "总现市场价 —",
         f"总税后价格 {total_after_tax:.2f}" if total_after_tax is not None else "总税后价格 —",
         f"实际折扣比率 {discount_ratio:.4f}" if discount_ratio is not None else "实际折扣比率 —",
-        f"总变现收益 {'+' if cash_profit and cash_profit >= 0 else ''}{cash_profit:.2f}" if cash_profit is not None else "总变现收益 —",
         f"总自用收益 {'+' if self_use_profit and self_use_profit >= 0 else ''}{self_use_profit:.2f}" if self_use_profit is not None else "总自用收益 —",
     ]
     if pl is not None and pl_pct is not None:

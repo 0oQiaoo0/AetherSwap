@@ -19,7 +19,6 @@ from app.state import (
 )
 from app.config_loader import (
     get_steam_credentials,
-    load_app_config_validated,
 )
 from app.shared_market import get_steam_smart_price_cny, batch_fetch_prices
 router = APIRouter()
@@ -163,11 +162,7 @@ def api_transactions(enrich_current_price: bool = False):
     out.sort(key=lambda x: x["at"], reverse=True)
     if enrich_current_price and is_steam_background_allowed():
         _enrich_purchases_with_current_prices(out)
-    cfg = load_app_config_validated().get("pipeline", {})
-    resell_ratio = float(cfg.get("resell_ratio", 0.85))
-    if resell_ratio <= 0:
-        resell_ratio = 0.85
-    return {"transactions": out, "resell_ratio": resell_ratio}
+    return {"transactions": out}
 @router.delete("/api/transaction")
 def api_delete_transaction(type: str = "purchase", idx: int = 0, db_id: int = 0):
     if type == "purchase":

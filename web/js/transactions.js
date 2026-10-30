@@ -3,8 +3,7 @@ let holdingsMultiSelectMode = false;
 let historyMultiSelectMode = false;
 let lastEnrichTime = 0;
 let lastEnrichData = null;
-function renderTxTable(tbody, list, isPurchase = false, resellRatio = 0.85, multiSelectMode = false) {
-  const ratio = Math.max(0.01, Math.min(1, Number(resellRatio) || 0.85));
+function renderTxTable(tbody, list, isPurchase = false, multiSelectMode = false) {
   const rowHtmls = [];
   for (const t of list) {
     const at = t.at ? new Date(t.at * 1000) : null;
@@ -35,17 +34,13 @@ function renderTxTable(tbody, list, isPurchase = false, resellRatio = 0.85, mult
       const afterTaxVal = cur != null && cur > 0 ? cur / 1.15 : null;
       const afterTax = afterTaxVal != null ? afterTaxVal.toFixed(2) : "";
       const discountRatio = afterTaxVal != null && afterTaxVal > 0 && cost > 0 ? (cost / afterTaxVal).toFixed(4) : "";
-      const discountRatioClass = discountRatio ? (parseFloat(discountRatio) > ratio ? "text-bad" : "text-ok") : "";
-      const cashProfit = afterTaxVal != null && cost > 0 ? (afterTaxVal * ratio - cost).toFixed(2) : "";
-      const profitClass = cashProfit ? (parseFloat(cashProfit) > 0 ? "text-ok" : parseFloat(cashProfit) < 0 ? "text-bad" : "") : "";
       const selfUseProfit = afterTaxVal != null && cost > 0 ? (afterTaxVal - cost).toFixed(2) : "";
       const selfUseClass = selfUseProfit ? (parseFloat(selfUseProfit) > 0 ? "text-ok" : parseFloat(selfUseProfit) < 0 ? "text-bad" : "") : "";
       const afterTaxCell = afterTax ? `<td class="mono">${escapeHtml(afterTax)}</td>` : "<td></td>";
-      const discountRatioCell = discountRatio ? `<td class="mono ${discountRatioClass}">${escapeHtml(discountRatio)}</td>` : "<td></td>";
-      const profitCell = cashProfit ? `<td class="mono ${profitClass}">${escapeHtml(parseFloat(cashProfit) >= 0 ? "+" + cashProfit : cashProfit)}</td>` : "<td></td>";
+      const discountRatioCell = discountRatio ? `<td class="mono">${escapeHtml(discountRatio)}</td>` : "<td></td>";
       const selfUseCell = selfUseProfit ? `<td class="mono ${selfUseClass}">${escapeHtml(parseFloat(selfUseProfit) >= 0 ? "+" + selfUseProfit : selfUseProfit)}</td>` : "<td></td>";
       const assetidCell = `<td class="mono">${escapeHtml(t.assetid ?? "—")}</td>`;
-      rowHtmls.push(`<tr>${checkCell}<td class="mono">${escapeHtml(timeStr)}</td><td>${escapeHtml(nameText)}</td>${assetidCell}${priceCell}<td class="mono">${escapeHtml(mp)}</td><td class="mono">${escapeHtml(cmp)}</td>${afterTaxCell}${discountRatioCell}${profitCell}${selfUseCell}${plCell}<td class="tx-actions">${actHtml}</td></tr>`);
+      rowHtmls.push(`<tr>${checkCell}<td class="mono">${escapeHtml(timeStr)}</td><td>${escapeHtml(nameText)}</td>${assetidCell}${priceCell}<td class="mono">${escapeHtml(mp)}</td><td class="mono">${escapeHtml(cmp)}</td>${afterTaxCell}${discountRatioCell}${selfUseCell}${plCell}<td class="tx-actions">${actHtml}</td></tr>`);
     } else {
       const assetidCell = `<td class="mono">${escapeHtml(t.assetid ?? "—")}</td>`;
       rowHtmls.push(`<tr>${checkCell}<td class="mono">${escapeHtml(timeStr)}</td><td>${escapeHtml(nameText)}</td>${assetidCell}${priceCell}<td class="tx-actions">${actHtml}</td></tr>`);
@@ -116,8 +111,7 @@ function renderTxTable(tbody, list, isPurchase = false, resellRatio = 0.85, mult
     });
   });
 }
-function renderPurchaseHistoryTable(tbody, list, resellRatio = 0.85, multiSelectMode = false) {
-  const ratio = Math.max(0.01, Math.min(1, Number(resellRatio) || 0.85));
+function renderPurchaseHistoryTable(tbody, list, multiSelectMode = false) {
   const sorted = list.slice().sort((a, b) => (b.at || 0) - (a.at || 0));
   const rowHtmls = [];
   for (const t of sorted) {
@@ -133,17 +127,13 @@ function renderPurchaseHistoryTable(tbody, list, resellRatio = 0.85, multiSelect
     const statusStr = t.pending_receipt ? "待收货" : sold ? "已出售" : listingError ? "ERROR" : t.listing ? "出售中" : "持有中";
     const statusCellClass = t.pending_receipt ? "status-pending" : sold ? "status-sold" : listingError ? "status-error" : t.listing ? "status-listing" : "status-holding";
     const salePriceStr = sold ? Number(t.sale_price).toFixed(2) : "—";
-    let discountRatioStr = "—", cashProfitStr = "—", selfUseStr = "—", discountRatioClass = "";
+    let discountRatioStr = "—", selfUseStr = "—";
     if (sold) {
       const afterTax = Number(t.sale_price) / 1.15;
       discountRatioStr = afterTax > 0 && cost > 0 ? (cost / afterTax).toFixed(4) : "—";
-      discountRatioClass = discountRatioStr !== "—" ? (parseFloat(discountRatioStr) > ratio ? "text-bad" : "text-ok") : "";
-      const cashProfit = afterTax > 0 && cost >= 0 ? afterTax * ratio - cost : 0;
       const selfUse = afterTax - cost;
-      cashProfitStr = (cashProfit >= 0 ? "+" : "") + cashProfit.toFixed(2);
       selfUseStr = (selfUse >= 0 ? "+" : "") + selfUse.toFixed(2);
     }
-    const cashClass = sold && parseFloat(cashProfitStr) !== 0 ? (parseFloat(cashProfitStr) > 0 ? "text-ok" : "text-bad") : "";
     const selfUseClass = sold && parseFloat(selfUseStr) !== 0 ? (parseFloat(selfUseStr) > 0 ? "text-ok" : "text-bad") : "";
     let deviationCell = "<td></td>";
     if (sold) {
@@ -164,7 +154,7 @@ function renderPurchaseHistoryTable(tbody, list, resellRatio = 0.85, multiSelect
     const delistBtn = !multiSelectMode && t.listing ? `<button type="button" class="btn btn-sm btn-warning-outline ph-btn-delist" data-type="purchase" data-idx="${idx}" data-db-id="${dbId}">下架</button> ` : "";
     const actHtml = !multiSelectMode ? (delistBtn + `<button type="button" class="btn btn-sm btn-danger-outline ph-btn-del" data-type="purchase" data-idx="${idx}">删除</button>`) : "";
     const assetidStr = t.assetid ?? "—";
-    rowHtmls.push(`<tr>${checkCell}<td class="mono">${escapeHtml(timeStr)}</td><td>${escapeHtml(nameText)}</td><td class="mono">${escapeHtml(assetidStr)}</td><td class="mono">${escapeHtml(Number(t.price).toFixed(2))}</td><td class="mono">${escapeHtml(mp)}</td><td class="status-cell ${statusCellClass}">${escapeHtml(statusStr)}</td><td class="mono">${escapeHtml(salePriceStr)}</td><td class="mono ${discountRatioClass}">${escapeHtml(discountRatioStr)}</td><td class="mono ${cashClass}">${escapeHtml(cashProfitStr)}</td><td class="mono ${selfUseClass}">${escapeHtml(selfUseStr)}</td>${deviationCell}<td class="tx-actions">${actHtml}</td></tr>`);
+    rowHtmls.push(`<tr>${checkCell}<td class="mono">${escapeHtml(timeStr)}</td><td>${escapeHtml(nameText)}</td><td class="mono">${escapeHtml(assetidStr)}</td><td class="mono">${escapeHtml(Number(t.price).toFixed(2))}</td><td class="mono">${escapeHtml(mp)}</td><td class="status-cell ${statusCellClass}">${escapeHtml(statusStr)}</td><td class="mono">${escapeHtml(salePriceStr)}</td><td class="mono">${escapeHtml(discountRatioStr)}</td><td class="mono ${selfUseClass}">${escapeHtml(selfUseStr)}</td>${deviationCell}<td class="tx-actions">${actHtml}</td></tr>`);
   }
   tbody.innerHTML = rowHtmls.join("");
   tbody.querySelectorAll(".ph-btn-delist").forEach(btn => {
@@ -211,13 +201,12 @@ function renderPurchaseHistoryTable(tbody, list, resellRatio = 0.85, multiSelect
     });
   });
 }
-function applyTransactionsToUI(all, summaryEl, tbodyP, tbodyS, tbodyHistory, resellRatio = 0.85) {
+function applyTransactionsToUI(all, summaryEl, tbodyP, tbodyS, tbodyHistory) {
   const purchases = all.filter((t) => t.type === "purchase");
   const holdings = purchases.filter((t) => !(t.sale_price != null && Number(t.sale_price) > 0));
   const sales = all.filter((t) => t.type === "sale");
-  const ratio = Math.max(0.01, Math.min(1, Number(resellRatio) || 0.85));
-  if (tbodyP) renderTxTable(tbodyP, holdings, true, ratio, holdingsMultiSelectMode);
-  if (tbodyHistory) renderPurchaseHistoryTable(tbodyHistory, purchases, ratio, historyMultiSelectMode);
+  if (tbodyP) renderTxTable(tbodyP, holdings, true, holdingsMultiSelectMode);
+  if (tbodyHistory) renderPurchaseHistoryTable(tbodyHistory, purchases, historyMultiSelectMode);
   syncHistoryMultiSelectUI();
   const historySummaryEl = el("purchase-history-summary");
   if (historySummaryEl && purchases.length) {
@@ -226,19 +215,15 @@ function applyTransactionsToUI(all, summaryEl, tbodyP, tbodyS, tbodyHistory, res
     const totalSalePrice = purchases.reduce((s, t) => s + (t.sale_price != null && Number(t.sale_price) > 0 ? Number(t.sale_price) : 0), 0);
     const totalAfterTax = totalSalePrice > 0 ? totalSalePrice / 1.15 : null;
     const soldItems = purchases.filter((t) => t.sale_price != null && Number(t.sale_price) > 0);
-    let ratioSum = 0, ratioCount = 0, totalCashProfit = 0, totalSelfUseProfit = 0;
+    let ratioSum = 0, ratioCount = 0, totalSelfUseProfit = 0;
     soldItems.forEach((t) => {
       const afterTax = Number(t.sale_price) / 1.15;
       const cost = Number(t.price) || 0;
       if (afterTax > 0 && cost > 0) { ratioSum += cost / afterTax; ratioCount += 1; }
-      totalCashProfit += afterTax * ratio - cost;
       totalSelfUseProfit += afterTax - cost;
     });
     const discountRatio = ratioCount > 0 ? (ratioSum / ratioCount).toFixed(4) : "—";
-    const discountRatioClass = discountRatio !== "—" ? (parseFloat(discountRatio) > ratio ? "text-bad" : "text-ok") : "";
-    const cashProfitVal = soldItems.length > 0 ? totalCashProfit : null;
     const selfUseProfitVal = soldItems.length > 0 ? totalSelfUseProfit : null;
-    const profitClass = cashProfitVal != null && cashProfitVal > 0 ? "text-ok" : cashProfitVal != null && cashProfitVal < 0 ? "text-bad" : "";
     const selfUseClass = selfUseProfitVal != null && selfUseProfitVal > 0 ? "text-ok" : selfUseProfitVal != null && selfUseProfitVal < 0 ? "text-bad" : "";
     const soldMp = purchases.reduce((s, t) => s + (t.sale_price != null && Number(t.sale_price) > 0 && t.market_price != null ? Number(t.market_price) : 0), 0);
     const totalDeviation = totalSalePrice > 0 && soldMp > 0 ? totalSalePrice - soldMp : null;
@@ -247,15 +232,13 @@ function applyTransactionsToUI(all, summaryEl, tbodyP, tbodyS, tbodyHistory, res
     const deviationStr = totalDeviation != null ? `${totalDeviation >= 0 ? "+" : ""}${totalDeviation.toFixed(2)} (${totalDeviation >= 0 ? "+" : ""}${totalDeviationPct})` : "—";
     const salePriceStr = totalSalePrice > 0 ? totalSalePrice.toFixed(2) : "—";
     const afterTaxStr = totalAfterTax != null ? totalAfterTax.toFixed(2) : "—";
-    const cashProfitStr = cashProfitVal != null ? (cashProfitVal >= 0 ? "+" : "") + cashProfitVal.toFixed(2) : "—";
     const selfUseProfitStr = selfUseProfitVal != null ? (selfUseProfitVal >= 0 ? "+" : "") + selfUseProfitVal.toFixed(2) : "—";
     historySummaryEl.innerHTML = [
       `<span class="summary-stat"><span class="summary-label">总购入价</span><span class="summary-value mono">${totalPrice.toFixed(2)}</span></span>`,
       `<span class="summary-stat"><span class="summary-label">总购入市场价</span><span class="summary-value mono">${totalMp.toFixed(2)}</span></span>`,
       `<span class="summary-stat"><span class="summary-label">总出售价</span><span class="summary-value mono">${salePriceStr}</span></span>`,
       `<span class="summary-stat"><span class="summary-label">总税后价格</span><span class="summary-value mono">${afterTaxStr}</span></span>`,
-      `<span class="summary-stat"><span class="summary-label">实际折扣比率</span><span class="summary-value mono ${discountRatioClass}">${discountRatio}</span></span>`,
-      `<span class="summary-stat"><span class="summary-label">总变现收益</span><span class="summary-value mono ${profitClass}">${cashProfitStr}</span></span>`,
+      `<span class="summary-stat"><span class="summary-label">实际折扣比率</span><span class="summary-value mono">${discountRatio}</span></span>`,
       `<span class="summary-stat"><span class="summary-label">总自用收益</span><span class="summary-value mono ${selfUseClass}">${selfUseProfitStr}</span></span>`,
       `<span class="summary-stat"><span class="summary-label">总价格偏离度</span><span class="summary-value mono ${deviationClass}">${deviationStr}</span></span>`,
     ].join("");
@@ -286,23 +269,18 @@ function applyTransactionsToUI(all, summaryEl, tbodyP, tbodyS, tbodyHistory, res
     const plStr = totalPl != null ? `${totalPl >= 0 ? "+" : ""}${totalPl.toFixed(2)} (${totalPl >= 0 ? "+" : ""}${totalPlPct})` : "—";
     const totalAfterTax = totalCmp != null && totalCmp > 0 ? totalCmp / 1.15 : null;
     const afterTaxStr = totalAfterTax != null ? totalAfterTax.toFixed(2) : "—";
-    let ratioSum = 0, ratioCount = 0, totalCashProfit = 0, totalSelfUseProfit = 0;
+    let ratioSum = 0, ratioCount = 0, totalSelfUseProfit = 0;
     holdings.forEach((t) => {
       const cmp = t.current_market_price != null ? Number(t.current_market_price) : null;
       if (cmp == null || cmp <= 0) return;
       const afterTax = cmp / 1.15;
       const cost = Number(t.price) || 0;
       if (afterTax > 0 && cost > 0) { ratioSum += cost / afterTax; ratioCount += 1; }
-      totalCashProfit += afterTax * ratio - cost;
       totalSelfUseProfit += afterTax - cost;
     });
     const discountRatio = ratioCount > 0 ? (ratioSum / ratioCount).toFixed(4) : "—";
-    const discountRatioClass = discountRatio !== "—" ? (parseFloat(discountRatio) > ratio ? "text-bad" : "text-ok") : "";
-    const cashProfitVal = ratioCount > 0 ? totalCashProfit : null;
     const selfUseProfitVal = ratioCount > 0 ? totalSelfUseProfit : null;
-    const profitClass = cashProfitVal != null && cashProfitVal > 0 ? "text-ok" : cashProfitVal != null && cashProfitVal < 0 ? "text-bad" : "";
     const selfUseProfitClass = selfUseProfitVal != null && selfUseProfitVal > 0 ? "text-ok" : selfUseProfitVal != null && selfUseProfitVal < 0 ? "text-bad" : "";
-    const cashProfitStr = cashProfitVal != null ? (cashProfitVal >= 0 ? "+" : "") + cashProfitVal.toFixed(2) : "—";
     const selfUseProfitStr = selfUseProfitVal != null ? (selfUseProfitVal >= 0 ? "+" : "") + selfUseProfitVal.toFixed(2) : "—";
     summaryEl.innerHTML = [
       `<span class="summary-stat"><span class="summary-label">数量</span><span class="summary-value mono">${holdings.length}</span></span>`,
@@ -310,8 +288,7 @@ function applyTransactionsToUI(all, summaryEl, tbodyP, tbodyS, tbodyHistory, res
       `<span class="summary-stat"><span class="summary-label">总购入市场价</span><span class="summary-value mono">${totalMp.toFixed(2)}</span></span>`,
       `<span class="summary-stat"><span class="summary-label">总现市场价</span><span class="summary-value mono">${cmpStr}</span></span>`,
       `<span class="summary-stat"><span class="summary-label">总税后价格</span><span class="summary-value mono">${afterTaxStr}</span></span>`,
-      `<span class="summary-stat"><span class="summary-label">实际折扣比率</span><span class="summary-value mono ${discountRatioClass}">${discountRatio}</span></span>`,
-      `<span class="summary-stat"><span class="summary-label">总变现收益</span><span class="summary-value mono ${profitClass}">${cashProfitStr}</span></span>`,
+      `<span class="summary-stat"><span class="summary-label">实际折扣比率</span><span class="summary-value mono">${discountRatio}</span></span>`,
       `<span class="summary-stat"><span class="summary-label">总自用收益</span><span class="summary-value mono ${selfUseProfitClass}">${selfUseProfitStr}</span></span>`,
       `<span class="summary-stat"><span class="summary-label">总市场变动</span><span class="summary-value mono ${plClass}">${plStr}</span></span>`,
     ].join("");
@@ -322,7 +299,7 @@ function applyTransactionsToUI(all, summaryEl, tbodyP, tbodyS, tbodyHistory, res
   if (summaryEl && holdings.length) summaryEl.style.display = "";
   if (summaryEl && !holdings.length) summaryEl.style.display = "none";
   if (tbodyS) renderTxTable(tbodyS, sales, false);
-  refreshAnalytics(purchases, ratio);
+  refreshAnalytics(purchases);
   syncHoldingsMultiSelectUI();
 }
 function syncHoldingsMultiSelectUI() {
@@ -372,7 +349,7 @@ async function refreshTransactions() {
       if (e && e.current_market_price != null) t.current_market_price = e.current_market_price;
     }
     lastEnrichData = all;
-    applyTransactionsToUI(all, summaryEl, tbodyP, tbodyS, tbodyHistory, d.resell_ratio);
+    applyTransactionsToUI(all, summaryEl, tbodyP, tbodyS, tbodyHistory);
   } catch (e) {
     toast("加载操作记录失败", e.message || "");
   }

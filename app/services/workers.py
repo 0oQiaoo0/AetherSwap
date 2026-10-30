@@ -93,9 +93,6 @@ def run_holdings_report_once(force: bool = False) -> bool:
     token = (notify_cfg.get("pushplus_token") or "").strip()
     if not token:
         return False
-    resell_ratio = float(cfg.get("pipeline", {}).get("resell_ratio", 0.85))
-    if resell_ratio <= 0:
-        resell_ratio = 0.85
     def _build_out():
         purchases = get_purchases()
         out = []
@@ -118,7 +115,7 @@ def run_holdings_report_once(force: bool = False) -> bool:
     all_have_price = all(t.get("current_market_price") is not None for t in holdings_enriched)
     if not all_have_price:
         return False
-    _, total_mp, _, _, pl_pct, _ = compute_holdings_stats(holdings_enriched, resell_ratio)
+    _, total_mp, _, _, pl_pct = compute_holdings_stats(holdings_enriched)
     if not force:
         drop_threshold_pct = float(notify_cfg.get("holdings_report_change_threshold_pct", 20) or 20)
         last_pl_pct = _load_last_pl_pct()
@@ -131,7 +128,7 @@ def run_holdings_report_once(force: bool = False) -> bool:
         drop = last_pl_pct - pl_pct  
         if drop < drop_threshold_pct:
             return False
-    content = build_holdings_report_content(holdings_enriched, resell_ratio)
+    content = build_holdings_report_content(holdings_enriched)
     ok = send_pushplus(token, "持有饰品紧急回报" if not force else "持有饰品定时回报", content)
     if ok and pl_pct is not None:
         _save_last_pl_pct(pl_pct)
